@@ -226,6 +226,12 @@ impl TerminalView {
             }
             AmbientAgentViewModelEvent::SessionReady { .. }
             | AmbientAgentViewModelEvent::FollowupSessionReady { .. } => {
+                if matches!(
+                    event,
+                    AmbientAgentViewModelEvent::FollowupSessionReady { .. }
+                ) {
+                    self.pending_cloud_followup_task_id = None;
+                }
                 // Auto-open details panel for local cloud mode once the session is ready.
                 self.maybe_auto_open_cloud_mode_details_panel(ctx);
                 // Re-render to hide the loading screen now that the session is ready.
@@ -247,6 +253,7 @@ impl TerminalView {
                 ctx.notify();
             }
             AmbientAgentViewModelEvent::Failed { error_message } => {
+                self.pending_cloud_followup_task_id = None;
                 self.update_active_ambient_agent_conversation_status(
                     ConversationStatus::Error,
                     Some(error_message.clone()),
@@ -282,6 +289,7 @@ impl TerminalView {
                 ctx.notify();
             }
             AmbientAgentViewModelEvent::NeedsGithubAuth => {
+                self.pending_cloud_followup_task_id = None;
                 if self.active_ambient_agent_conversation_is_child(ctx) {
                     self.update_active_ambient_agent_conversation_status(
                         ConversationStatus::Blocked {
@@ -296,6 +304,7 @@ impl TerminalView {
                 ctx.notify();
             }
             AmbientAgentViewModelEvent::Cancelled => {
+                self.pending_cloud_followup_task_id = None;
                 self.update_active_ambient_agent_conversation_status(
                     ConversationStatus::Cancelled,
                     None,
