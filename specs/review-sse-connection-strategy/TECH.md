@@ -2,7 +2,7 @@
 
 ## Context
 
-`OrchestrationEventStreamer` (`app/src/ai/blocklist/orchestration_event_streamer.rs`) delivers v2 orchestration events (cross-agent messages and lifecycle events) into a conversation by holding a long-lived SSE connection per conversation. The polling fallback path is being removed in a separate change — once the `OrchestrationEventPush` flag is gone, the poller code is SSE-only and gated solely on `OrchestrationV2`. This spec assumes the polling path no longer exists, so the only state and code paths described below are the SSE ones.
+`OrchestrationEventStreamer` (`app/src/ai/blocklist/orchestration_event_streamer.rs`) delivers v2 orchestration events (cross-agent messages and lifecycle events) into a conversation by holding a long-lived SSE connection per conversation. The streamer is SSE-only and gated solely on `OrchestrationV2`; the previous polling fallback path was removed before this change so all state and code paths described below are SSE-only.
 
 A key semantic to keep in mind throughout: **an agent run subscribes to its own `run_id` because that subscription is its inbox.** Server-side, `AgentEventDriverConfig::run_ids` filters events whose run_id matches the set; for a given agent run, events with `run_id == self_run_id` are messages and lifecycle signals destined for that run. Both parent agent runs and child agent runs (including headless CLI children of any harness) must keep this subscription up while their run is active in order to receive messages.
 
@@ -21,33 +21,33 @@ There is also a related state-leak: `register_watched_run_id` (line 138) only in
 - `app/src/ai/active_agent_views_model.rs` — already tracks "is this conversation expanded in any pane?" via `agent_view_handles`. Emits `ActiveAgentViewsEvent::ConversationClosed { conversation_id }` on `ExitedAgentView` (line 167-169) and on `unregister_agent_view_controller` from the pane-close path (line 200-202; see `pane_group/pane/terminal_pane.rs:383-385`). Helper `is_conversation_open(conversation_id, ctx)` (line 354) gives the cross-pane "open anywhere?" check.
 - `app/src/ai/agent/conversation.rs:781-792` — `parent_conversation_id()` and `is_child_agent_conversation()` classify a conversation as child or non-child; combined with the poller's own `watched_run_ids` set these classify a conversation as parent/child/solo.
 - `app/src/ai/agent_events/driver.rs (38-50, 177-199)` — `AgentEventDriverConfig::run_ids` is forwarded to `ServerApi::stream_agent_events` and is the server-side filter for which events come back. A run watching its own run_id is using that subscription as its inbox.
-- `app/src/ai/agent_sdk/driver.rs` — drives Oz conversations headlessly via the Warp CLI (locally for `start_agent` with `execution_mode: local` + Oz harness, and on cloud workers for cloud Oz runs). The same `OrchestrationEventStreamer` singleton is registered here (`lib.rs:1564-1566` is unconditional aside from the `OrchestrationV2` feature flag), so the poller must serve a CLI/cloud process where there are no `AgentViewController` registrations at all.
+- `app/src/ai/agent_sdk/driver.rs` — drives Oz conversations headlessly via the Warp CLI (locally for `start_agent` with `execution_mode: local` + Oz harness, and on cloud workers for cloud Oz runs). The same `OrchestrationEventStreamer` singleton is registered here (`lib.rs:1564-1566` is unconditional aside from the `OrchestrationV2` feature flag), so the streamer must serve a CLI/cloud process where there are no `AgentViewController` registrations at all.
 
 ## Proposed changes
 
 ### Consumer abstraction
 
-The poller's job is to deliver events to a consumer. Today there is one implicit consumer (the agent view), but in CLI and cloud worker processes the consumer is the `agent_sdk::driver` itself, which has no agent view. Generalize this: the poller owns a set of registered *consumers* per conversation, where a consumer is anything that needs orchestration events delivered for that conversation.
+The streamer's job is to deliver events to a consumer. Today there is one implicit consumer (the agent view), but in CLI and cloud worker processes the consumer is the `agent_sdk::driver` itself, which has no agent view. Generalize this: the streamer owns a set of registered *consumers* per conversation, where a consumer is anything that needs orchestration events delivered for that conversation.
 
-The registry lives **inside `OrchestrationEventStreamer`** as new state — e.g. `consumers: HashMap<AIConversationId, HashSet<ConsumerId>>` plus a small `ConsumerId` newtype — with two public methods on the poller:
+The registry lives **inside `OrchestrationEventStreamer`** as part of the per-conversation `ConversationStreamState` (a single `streams: HashMap<AIConversationId, ConversationStreamState>` map collects every per-conversation field — watched run_ids, cursor, pending message IDs, consumers, SSE connection, restore-retry counter — under one entry). Consumers are identified by `EntityId` (the terminal pane id for an agent view; the driver model id for `agent_sdk`). Two public methods drive the registry:
 
-- `register_consumer(conversation_id, consumer_id, ctx)` — inserts and re-evaluates eligibility, calling `start_event_delivery` if the conversation is newly eligible.
+- `register_consumer(conversation_id, consumer_id, ctx)` — inserts and re-evaluates eligibility through `reevaluate_eligibility`, which calls `start_sse_connection` if the conversation is newly eligible.
 - `unregister_consumer(conversation_id, consumer_id, ctx)` — removes and re-evaluates eligibility, tearing down the SSE if the conversation is no longer eligible.
 
-This avoids introducing a separate singleton and the event-subscribe plumbing that would come with it. The poller is the only consumer of these signals, so co-locating the state keeps the lifecycle decisions in one place.
+This avoids introducing a separate singleton and the event-subscribe plumbing that would come with it. The streamer is the only consumer of these signals, so co-locating the state keeps the lifecycle decisions in one place.
 
-Two callers wire up registrations:
+Two callers wire up registrations through the free helpers `register_agent_event_consumer` / `unregister_agent_event_consumer`:
 
-- The agent view path: `AgentViewController` calls `register_consumer` / `unregister_consumer` around its lifetime, mirroring its existing `register_agent_view_controller` / `unregister_agent_view_controller` calls. The poller does not subscribe to `ActiveAgentViewsModel` for this; the registration is direct.
-- The driver path: `agent_sdk::driver` calls the same methods around its run lifetime.
+- The agent view path: `ActiveAgentViewsModel` reacts to `EnteredAgentView` / `ExitedAgentView` and calls the helpers on behalf of the open view.
+- The driver path: `agent_sdk::driver` calls the same helpers around its run lifetime.
 
-The poller's eligibility check observes a single signal — `has_active_consumer(conversation_id)` reads from its own `consumers` map — and does not care which type registered. In the GUI client this collapses to "agent view is open somewhere"; in CLI/cloud workers it collapses to "the driver is running."
+The streamer's eligibility check observes a single signal — `has_active_consumer(conversation_id)` reads the conversation's stream entry — and does not care which type registered. In the GUI client this collapses to "agent view is open somewhere"; in CLI/cloud workers it collapses to "the driver is running."
 
-`ConsumerId` only needs to be unique enough to allow multiple concurrent registrations to coexist (e.g. agent view + driver, two agent views in different panes) and to support a clean unregister. A `Uuid` generated by the caller, or a typed enum like `ConsumerId::AgentView(EntityId) | ConsumerId::Driver(uuid::Uuid)`, both work.
+A single `EntityId` per consumer is enough: the streamer treats every consumer as opaque, the entity id is unique per pane / driver model, and unregister keys back to that same id.
 
 ### Eligibility predicate
 
-The poller treats parent and child agent runs differently because the trigger conditions are different, but both check the same consumer signal.
+The streamer treats parent and child agent runs differently because the trigger conditions are different, but both check the same consumer signal.
 
 **Child role** — the conversation has a parent agent run from this process's perspective. Two signals satisfy this: `parent_conversation_id.is_some()` (the parent has a local placeholder, set by `start_new_child_conversation` when the GUI parent spawned the child) OR `parent_agent_id.is_some()` (the conversation knows its parent's server-side agent identifier, which under v2 is the parent's `run_id`). The two signals address two different processes:
 
@@ -75,17 +75,17 @@ Where `has_active_consumer()` returns true when at least one `AgentViewControlle
 
 ### Subscription drivers
 
-**Children.** The trigger is server-token assignment, not status. In `on_server_token_assigned`, register the self run_id and call `start_event_delivery` immediately when `is_child_agent_conversation()` is true. Drop the `became_success` gate — children must be listening as soon as they have a run_id, regardless of status. Teardown for children happens only on `RemoveConversation` / `DeletedConversation` (existing logic).
+**Children.** The trigger is server-token assignment, not status. `on_server_token_assigned` calls `ensure_self_run_id_watched` to register the self run_id and re-runs `reevaluate_eligibility` immediately. Children must be listening as soon as they have a run_id, regardless of status. Teardown for children happens only on `RemoveConversation` / `DeletedConversation`.
 
 **Parents.** Subscribe to a single "consumer changed" signal from the registry described above:
 
-- On consumer-removed for a conversation: if `has_active_consumer()` returns false AND the conversation is not also a child, run the parent-only teardown described below. If it is also a child, leave the connection alone — the child role keeps it alive.
-- On consumer-added for a conversation: re-evaluate eligibility and call `start_event_delivery` if newly eligible. This handles both the GUI reopen case (agent view opened after being closed) and the CLI startup case (driver registered before any agent view exists).
-- `register_watched_run_id` (called from `start_agent.rs`) calls `start_event_delivery` after the insert. If a consumer exists, this opens or reconnects the SSE; if none exists, it is a no-op until a consumer registers.
+- On consumer-removed for a conversation: `reevaluate_eligibility` runs the predicate and tears the SSE down if the conversation is no longer eligible. If it is also a child, the child role keeps it alive.
+- On consumer-added for a conversation: `reevaluate_eligibility` opens the SSE if newly eligible. This handles both the GUI reopen case (agent view opened after being closed) and the CLI startup case (driver registered before any agent view exists).
+- `register_watched_run_id` (called from `start_agent.rs`) re-evaluates eligibility after the insert. If a consumer exists, this opens or reconnects the SSE; if none exists, it is a no-op until a consumer registers.
 
-`start_event_delivery` itself stops checking `became_success`; it verifies the eligibility predicate and opens an SSE connection. Status is no longer part of the lifecycle decision for either role.
+`reevaluate_eligibility` is the single dispatch point: it computes the eligibility predicate and either calls `start_sse_connection`, reconnects, or tears down. Status is not part of the lifecycle decision for either role.
 
-The agent_sdk driver registers itself as a consumer at the start of its run (a natural place is `AgentDriver::execute_run` for Oz, or where the third-party harness path picks up the `task_id` for ThirdParty harnesses) and unregisters when the run terminates. Registration is by `AIConversationId` so it composes with the existing per-conversation poller state.
+The agent_sdk driver registers itself as a consumer at the start of its run (a natural place is `AgentDriver::execute_run` for Oz, or where the third-party harness path picks up the `task_id` for ThirdParty harnesses) and unregisters when the run terminates. Registration is by `AIConversationId` so it composes with the existing per-conversation streamer state.
 
 Because both roles share a single SSE connection per conversation, the SSE's `run_ids` filter must be the union of `{self_run_id}` (child role) and the registered child run_ids (parent role), where each role's contribution is included only when that role's eligibility is met. The simplest implementation is to compute the run_id list at SSE-open time from current state.
 
@@ -93,24 +93,24 @@ Because both roles share a single SSE connection per conversation, the SSE's `ru
 
 Eligibility depends on three pieces of state, each of which lands at a different time and is set by a different code path:
 
-- `is_child_agent_conversation()` — set when a child conversation is created with `parent_conversation_id`. Available before any run_id is assigned.
+- `Conversation::has_parent_agent()` — true when the conversation has either `parent_conversation_id` (set on a child created with a local placeholder) or `parent_agent_id` (the parent's run_id, stamped by the agent_sdk driver in driver-hosted processes). Available before any run_id is assigned for the local-placeholder case; depends on the parent's run_id for the driver case.
 - `self_run_id` — set on `ConversationServerTokenAssigned` for this conversation.
 - Watched child run_ids on a parent — added by `register_watched_run_id` only after the *child* receives its server token (`start_agent.rs` waits for `ConversationServerTokenAssigned` on the child, then registers under the parent).
 
-A consumer that registers earlier than any of these will not yet make the conversation eligible. That is fine: re-evaluation happens at every state change, so the SSE opens at the moment eligibility flips, regardless of which event arrived first. Concretely, the poller re-runs the predicate at exactly four sites:
+A consumer that registers earlier than any of these will not yet make the conversation eligible. That is fine: re-evaluation happens at every state change, so the SSE opens at the moment eligibility flips, regardless of which event arrived first. Concretely, the streamer re-runs the predicate at exactly four sites:
 
 1. `register_consumer` and `unregister_consumer` — consumer set changed.
 2. `register_watched_run_id` — a child run_id was added to a parent's set.
 3. `on_server_token_assigned` — this conversation received its run_id (and may now be a child).
-4. `RemoveConversation` / `DeletedConversation` for any other conversation — if it was a child of this one, its run_id was just pruned from this parent's set; the parent may have no remaining children.
+4. `on_conversation_removed` for any other conversation — if it was a child of this one, its run_id was just pruned from this parent's watched set; the parent may have no remaining children.
 
-A consumer never needs to re-register on its own to chase the run_id. It registers once at the start of its lifetime and unregisters once at the end; the poller is responsible for catching up state changes in between.
+A consumer never needs to re-register on its own to chase the run_id. It registers once at the start of its lifetime and unregisters once at the end; the streamer is responsible for catching up state changes in between.
 
 A practical consequence for the GUI: opening an agent view for a brand-new conversation calls `register_consumer` immediately, but no SSE opens until either the conversation receives `ConversationServerTokenAssigned` (and is found to be a child) or `register_watched_run_id` runs against it (when its first child is spawned). For the CLI/cloud driver path the same applies: the driver registers immediately at run start, but the SSE waits until the run_id is assigned.
 
 ### Solo exclusion at registration time
 
-Change `on_server_token_assigned` to register the conversation's own run_id only when the conversation is already a child (`is_child_agent_conversation()`). Conversations that are not yet children at server-token time may later become parents via `register_watched_run_id`; that path already handles parent registration without needing self_run_id, so solo conversations stay out of `watched_run_ids` entirely until and unless they enter the orchestration tree as a parent.
+`on_server_token_assigned` calls `ensure_self_run_id_watched`, which inserts the conversation's own run_id only when the conversation already has a role: it has a parent (`Conversation::has_parent_agent()`) or it is already a parent (some other watched run_id is registered). Conversations that are not yet children at server-token time may later become parents via `register_watched_run_id`; that path runs `ensure_self_run_id_watched` again to add the self run_id once the parent role kicks in, so solo conversations stay out of the watched set entirely until and unless they enter the orchestration tree.
 
 This avoids opening inbox subscriptions for conversations that have no orchestration role.
 
@@ -125,13 +125,7 @@ After the prune, re-evaluate the parent's eligibility:
 
 ### Reconnect behavior
 
-`reconnect_sse` (line 666) currently checks `watched_run_ids.contains_key` before re-opening. Replace that with the full eligibility predicate: if the conversation is no longer eligible, drop the connection without reopening.
-
-The proactive reconnect (`AgentEventDriverConfig::proactive_reconnect_after`, ~14 minutes) and error-driven reconnect both pass through this gate, so an ineligible conversation stops reconnecting automatically.
-
-### Removal of dead status-tracking code
-
-With the `became_success` gate gone, `on_conversation_status_updated` (line 211-238), the `conversation_statuses` field (line 95), and the `UpdatedConversationStatus` arm of `handle_history_event` have no remaining purpose. Remove them in this change. Also drop the `conversation_statuses.remove(...)` line from the `RemoveConversation` / `DeletedConversation` arm (line 188). Verify no other consumer of the poller depends on these fields before deletion.
+`reconnect_sse` runs the full `is_eligible` predicate before re-opening: if the conversation is no longer eligible, the connection is dropped without re-opening. The proactive reconnect (`AgentEventDriverConfig::proactive_reconnect_after`, ~14 minutes) and error-driven reconnect both pass through this gate, so an ineligible conversation stops reconnecting automatically.
 
 ### State machine
 
@@ -158,7 +152,7 @@ stateDiagram-v2
     Solo --> [*]: conversation removed
 ```
 
-A conversation is in `Subscribed` iff there is an entry in `sse_connections`. Exiting `Subscribed` always tears down the SSE.
+A conversation is in `Subscribed` iff its entry in `streams` has `sse_connection.is_some()`. Exiting `Subscribed` always tears down the SSE.
 
 ## Testing and validation
 
@@ -279,5 +273,4 @@ Run `./script/presubmit` before opening the PR. Add a `CHANGELOG-IMPROVEMENT:` l
 
 ## Follow-ups
 
-- This spec assumes the `OrchestrationEventPush` flag and polling fallback are removed first. If that flag removal hasn't landed by the time implementation starts, additionally delete: `should_use_sse`, `poll_and_inject`, `start_idle_poll_timer`, `handle_event_batch`, `poll_backoff_index`, `poll_in_flight`, `pending_delivery` (the poll-only fields), and the `POLL_BACKOFF_STEPS` / `EVENT_POLL_BATCH_LIMIT` constants. Verify nothing outside the poller depends on them.
-- Expose a debug snapshot from the poller (count of `sse_connections`, count of `watched_run_ids` entries, total run_ids across all sets, count of registered consumers per conversation, role classification per conversation) so we can monitor connection scope in production via a dev panel or telemetry.
+- Expose a debug snapshot from the streamer (count of streams with an open `sse_connection`, count of streams with non-empty `watched_run_ids`, total run_ids across all sets, count of registered consumers per conversation, role classification per conversation) so we can monitor connection scope in production via a dev panel or telemetry.

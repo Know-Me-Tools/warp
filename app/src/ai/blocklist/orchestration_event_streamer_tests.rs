@@ -221,11 +221,11 @@ fn finish_restore_fetch_uses_server_cursor_when_sqlite_is_absent() {
             OrchestrationEventStreamer::new_with_clients_for_test(ai_client, server_api, ctx)
         });
 
-        // Seed event_cursor as on_restored_conversations would before spawning
-        // the async fetch. Without this the guard that detects mid-flight
-        // conversation deletion would fire and return early.
+        // Seed a stream entry as on_restored_conversations would before
+        // spawning the async fetch. Without this the guard that detects
+        // mid-flight conversation deletion would fire and return early.
         poller.update(&mut app, |me, _| {
-            me.event_cursor.insert(conversation_id, 0);
+            me.streams.entry(conversation_id).or_default();
         });
 
         let task_id: crate::ai::ambient_agents::AmbientAgentTaskId =
@@ -241,17 +241,14 @@ fn finish_restore_fetch_uses_server_cursor_when_sqlite_is_absent() {
         });
 
         poller.read(&app, |me, _| {
-            assert_eq!(me.event_cursor.get(&conversation_id).copied(), Some(42));
+            assert_eq!(
+                me.streams.get(&conversation_id).map(|s| s.event_cursor),
+                Some(42)
+            );
         });
     });
 }
 
-// NOTE: the legacy `restored_inprogress_parent_defers_delivery_until_success`
-// test was removed during the merge with the rewritten streamer: the new
-// eligibility predicate gates SSE on consumer-presence + role rather than
-// status, so an InProgress / Success transition no longer drives delivery.
-// Equivalent coverage of the consumer / role gate lives in this file's
-// other tests and in `active_agent_views_model_tests.rs`.
 #[test]
 fn handle_event_batch_persists_max_seq_to_history_model() {
     use crate::ai::agent::conversation::{AIConversation, AIConversationId};
@@ -351,9 +348,9 @@ fn handle_event_batch_persists_max_seq_to_history_model() {
 #[test]
 fn finish_restore_fetch_no_ops_when_conversation_deleted_mid_flight() {
     // If the conversation is removed while the async fetch is in-flight, the
-    // RemoveConversation handler clears event_cursor. finish_restore_fetch
-    // uses the missing cursor as a sentinel and must not re-populate
-    // watched_run_ids or event_cursor for the deleted conversation.
+    // RemoveConversation handler removes the streams entry. finish_restore_fetch
+    // uses the missing entry as a sentinel and must not re-populate
+    // streamer state for the deleted conversation.
     use crate::ai::agent::conversation::AIConversation;
     use crate::server::server_api::ai::MockAIClient;
     use crate::server::server_api::ServerApiProvider;
@@ -381,16 +378,15 @@ fn finish_restore_fetch_no_ops_when_conversation_deleted_mid_flight() {
             OrchestrationEventStreamer::new_with_clients_for_test(ai_client, server_api, ctx)
         });
 
-        // Seed cursor as on_restored_conversations would.
+        // Seed a stream entry as on_restored_conversations would.
         poller.update(&mut app, |me, _| {
-            me.event_cursor.insert(conversation_id, 0);
+            me.streams.entry(conversation_id).or_default();
         });
 
         // Simulate the RemoveConversation handler firing while the fetch is
-        // in-flight: it clears event_cursor (and all other state).
+        // in-flight: it drops the conversation's streamer state.
         poller.update(&mut app, |me, _| {
-            me.watched_run_ids.remove(&conversation_id);
-            me.event_cursor.remove(&conversation_id);
+            me.streams.remove(&conversation_id);
         });
 
         // The in-flight fetch now completes — with children.
@@ -410,12 +406,8 @@ fn finish_restore_fetch_no_ops_when_conversation_deleted_mid_flight() {
 
         poller.read(&app, |me, _| {
             assert!(
-                !me.watched_run_ids.contains_key(&conversation_id),
-                "watched_run_ids must not be repopulated for a deleted conversation"
-            );
-            assert!(
-                !me.event_cursor.contains_key(&conversation_id),
-                "event_cursor must not be repopulated for a deleted conversation"
+                !me.streams.contains_key(&conversation_id),
+                "streamer state must not be repopulated for a deleted conversation"
             );
         });
     });
@@ -470,22 +462,14 @@ fn finish_restore_fetch_reconnects_sse_when_children_added_to_open_connection() 
         let (_, rx) = futures::channel::mpsc::unbounded::<SseStreamItem>();
         let consumer_id = warpui::EntityId::new();
         poller.update(&mut app, |me, _| {
-            me.event_cursor.insert(conversation_id, 0);
-            me.watched_run_ids
-                .entry(conversation_id)
-                .or_default()
-                .insert(own_run_id.to_string());
-            me.consumers
-                .entry(conversation_id)
-                .or_default()
-                .insert(consumer_id);
-            me.sse_connections.insert(
-                conversation_id,
-                SseConnectionState {
-                    event_receiver: rx,
-                    generation: 0,
-                },
-            );
+            let stream = me.streams.entry(conversation_id).or_default();
+            stream.event_cursor = 0;
+            stream.watched_run_ids.insert(own_run_id.to_string());
+            stream.consumers.insert(consumer_id);
+            stream.sse_connection = Some(SseConnectionState {
+                event_receiver: rx,
+                generation: 0,
+            });
             me.next_sse_generation = 1;
         });
 
@@ -506,17 +490,18 @@ fn finish_restore_fetch_reconnects_sse_when_children_added_to_open_connection() 
 
         poller.read(&app, |me, _| {
             assert!(
-                me.watched_run_ids
+                me.streams
                     .get(&conversation_id)
-                    .is_some_and(|w| w.contains("child-run-1")),
+                    .is_some_and(|s| s.watched_run_ids.contains("child-run-1")),
                 "child run_id must be in watched set"
             );
             // The old generation-0 connection must have been replaced by a
             // new one with a higher generation, proving SSE was reconnected.
             let gen = me
-                .sse_connections
+                .streams
                 .get(&conversation_id)
-                .map(|s| s.generation);
+                .and_then(|s| s.sse_connection.as_ref())
+                .map(|c| c.generation);
             assert!(
                 gen.is_some_and(|g| g > 0),
                 "SSE must be reconnected (new generation) after children are discovered; got gen={gen:?}"
