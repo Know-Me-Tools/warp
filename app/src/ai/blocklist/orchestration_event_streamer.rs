@@ -432,6 +432,8 @@ impl OrchestrationEventStreamer {
             .conversation(&conversation_id)
             .and_then(|c| c.run_id());
 
+        // Drop all per-conversation streamer state in one go (cursor,
+        // pending IDs, consumers, watched run_ids, SSE connection).
         // Dropping the SSE receiver causes the driver task's next send
         // to fail and exit; the drain timer's `is_current` check then
         // no-ops on its next tick.
@@ -605,6 +607,14 @@ impl OrchestrationEventStreamer {
                 }
             }
             Err(err) => {
+                // If the conversation was removed mid-flight, drop the
+                // retry on the floor. Without this guard the retry timer
+                // would resurrect a stream entry via `entry().or_default()`
+                // and re-issue `get_ambient_agent_task` indefinitely for a
+                // deleted conversation.
+                if !self.streams.contains_key(&conv_id) {
+                    return;
+                }
                 log::warn!("Restore: get_agent_run failed for {conv_id:?}: {err:#}; will retry");
                 self.start_restore_fetch_retry_timer(conv_id, task_id, sqlite_cursor, ctx);
             }
@@ -643,20 +653,6 @@ impl OrchestrationEventStreamer {
     }
 
     // ---- Eligibility predicate ---------------------------------------
-
-    /// Child role: the conversation either has a local placeholder for
-    /// the parent (`parent_conversation_id`, set in the GUI parent) or
-    /// knows the parent's server-side run_id (`parent_agent_id`,
-    /// stamped by the agent_sdk driver in driver-hosted processes).
-    fn is_child_agent_conversation(
-        &self,
-        conversation_id: AIConversationId,
-        ctx: &warpui::AppContext,
-    ) -> bool {
-        BlocklistAIHistoryModel::as_ref(ctx)
-            .conversation(&conversation_id)
-            .is_some_and(|c| c.has_parent_agent())
-    }
 
     fn self_run_id(
         &self,
@@ -719,8 +715,10 @@ impl OrchestrationEventStreamer {
         if self.is_remote_run_view(conversation_id, ctx) {
             return false;
         }
-        self.is_child_agent_conversation(conversation_id, ctx)
-            || self.is_parent_agent_conversation(conversation_id, ctx)
+        let has_parent = BlocklistAIHistoryModel::as_ref(ctx)
+            .conversation(&conversation_id)
+            .is_some_and(|c| c.has_parent_agent());
+        has_parent || self.is_parent_agent_conversation(conversation_id, ctx)
     }
 
     /// Returns the list of run_ids to subscribe to for `conversation_id`.

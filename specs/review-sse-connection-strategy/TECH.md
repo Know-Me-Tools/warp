@@ -6,6 +6,8 @@
 
 A key semantic to keep in mind throughout: **an agent run subscribes to its own `run_id` because that subscription is its inbox.** Server-side, `AgentEventDriverConfig::run_ids` filters events whose run_id matches the set; for a given agent run, events with `run_id == self_run_id` are messages and lifecycle signals destined for that run. Both parent agent runs and child agent runs (including headless CLI children of any harness) must keep this subscription up while their run is active in order to receive messages.
 
+> **Note.** The "Today the lifecycle is wrong" subsection and the "Relevant code" listing below describe the *pre-rewrite* state of the streamer (then often called "the poller") that motivated this change. Specific identifiers, line numbers, and field names in those subsections are historical and no longer correspond to the current code. The "Proposed changes" section onwards reflects the implementation as it now exists.
+
 Today the lifecycle is wrong in three ways:
 
 1. **Wrong start trigger.** SSE only opens on the `ConversationStatus::Success` transition (`orchestration_event_streamer.rs:229-237`, `start_event_delivery` at line 494). A conversation that is open in the UI but still in-progress will not subscribe; conversely once it has subscribed, status no longer matters.

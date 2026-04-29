@@ -414,6 +414,70 @@ fn finish_restore_fetch_no_ops_when_conversation_deleted_mid_flight() {
 }
 
 #[test]
+fn finish_restore_fetch_err_does_not_resurrect_deleted_conversation() {
+    // Mirror image of `finish_restore_fetch_no_ops_when_conversation_deleted_mid_flight`
+    // but for the Err arm: a transient fetch failure on a conversation that
+    // was just removed must not resurrect a streams entry (which would then
+    // defeat the deletion sentinel inside the retry timer and cause an
+    // indefinite retry loop).
+    use crate::ai::agent::conversation::AIConversation;
+    use crate::server::server_api::ai::MockAIClient;
+    use crate::server::server_api::ServerApiProvider;
+    use std::sync::Arc;
+    use warpui::App;
+
+    App::test((), |mut app| async move {
+        let _v2_guard = FeatureFlag::OrchestrationV2.override_enabled(true);
+
+        let history_model = app.add_singleton_model(|_| BlocklistAIHistoryModel::new(vec![], &[]));
+
+        let mut conversation = AIConversation::new(false);
+        conversation.set_run_id("550e8400-e29b-41d4-a716-446655440500".to_string());
+        let conversation_id = conversation.id();
+        let terminal_view_id = warpui::EntityId::new();
+        history_model.update(&mut app, |model, ctx| {
+            model.restore_conversations(terminal_view_id, vec![conversation], ctx);
+        });
+
+        let mock = MockAIClient::new();
+        let ai_client: Arc<dyn AIClient> = Arc::new(mock);
+        let server_api = ServerApiProvider::new_for_test().get();
+
+        let poller = app.add_singleton_model(|ctx| {
+            OrchestrationEventStreamer::new_with_clients_for_test(ai_client, server_api, ctx)
+        });
+
+        // Seed the entry as on_restored_conversations would, then drop it
+        // (simulates the RemoveConversation handler firing while the fetch
+        // is in-flight).
+        poller.update(&mut app, |me, _| {
+            me.streams.entry(conversation_id).or_default();
+            me.streams.remove(&conversation_id);
+        });
+
+        // The in-flight fetch now completes with an error.
+        let task_id: crate::ai::ambient_agents::AmbientAgentTaskId =
+            "550e8400-e29b-41d4-a716-446655440000".parse().unwrap();
+        poller.update(&mut app, |me, ctx| {
+            me.finish_restore_fetch(
+                conversation_id,
+                task_id,
+                /* sqlite_cursor */ 0,
+                Err(anyhow::anyhow!("transient network failure")),
+                ctx,
+            );
+        });
+
+        poller.read(&app, |me, _| {
+            assert!(
+                !me.streams.contains_key(&conversation_id),
+                "Err retry must not resurrect a streams entry for a deleted conversation"
+            );
+        });
+    });
+}
+
+#[test]
 fn finish_restore_fetch_reconnects_sse_when_children_added_to_open_connection() {
     // When a status transition races with the restore fetch and opens SSE
     // before children are known, finish_restore_fetch must reconnect SSE
