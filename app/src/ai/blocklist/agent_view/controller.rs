@@ -817,9 +817,6 @@ impl AgentViewController {
             });
         }
 
-        // Streamer-consumer registration is handled by
-        // `ActiveAgentViewsModel` in response to the
-        // `EnteredAgentView` event below.
         ctx.emit(AgentViewControllerEvent::EnteredAgentView {
             conversation_id,
             is_new: exchange_count == 0,
@@ -962,9 +959,6 @@ impl AgentViewController {
             .map(|conversation| conversation.exchange_count())
             .unwrap_or(0);
 
-        // Streamer-consumer unregistration is handled by
-        // `ActiveAgentViewsModel` in response to the `ExitedAgentView`
-        // event below.
         ctx.emit(AgentViewControllerEvent::ExitedAgentView {
             conversation_id,
             origin,

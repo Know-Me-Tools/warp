@@ -6,7 +6,7 @@ use crate::ai::agent::conversation::AIConversationId;
 use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::ai::blocklist::agent_view::{AgentViewController, AgentViewControllerEvent};
 use crate::ai::blocklist::orchestration_event_streamer::{
-    register_agent_view_consumer, unregister_agent_view_consumer,
+    register_agent_event_consumer, unregister_agent_event_consumer,
 };
 use crate::ai::blocklist::BlocklistAIHistoryModel;
 use crate::terminal::model::session::active_session::ActiveSession;
@@ -134,7 +134,7 @@ impl ActiveAgentViewsModel {
             .agent_view_state()
             .active_conversation_id()
         {
-            register_agent_view_consumer(conversation_id, terminal_view_id, ctx);
+            register_agent_event_consumer(conversation_id, terminal_view_id, ctx);
         }
 
         ctx.subscribe_to_model(controller, move |model, event, ctx| match event {
@@ -159,7 +159,7 @@ impl ActiveAgentViewsModel {
                 }
                 // Bridge the controller's lifecycle into the streamer's
                 // per-conversation consumer registry.
-                register_agent_view_consumer(*conversation_id, terminal_view_id, ctx);
+                register_agent_event_consumer(*conversation_id, terminal_view_id, ctx);
                 // Emit so subscribers can move this conversation to the Active section.
                 ctx.emit(ActiveAgentViewsEvent::TerminalViewFocused);
             }
@@ -181,7 +181,7 @@ impl ActiveAgentViewsModel {
                         state.active_conversation_id = None;
                     }
                 }
-                unregister_agent_view_consumer(*conversation_id, terminal_view_id, ctx);
+                unregister_agent_event_consumer(*conversation_id, terminal_view_id, ctx);
                 // Emit so subscribers can move this conversation to the Past section.
                 ctx.emit(ActiveAgentViewsEvent::ConversationClosed {
                     conversation_id: *conversation_id,
@@ -219,7 +219,7 @@ impl ActiveAgentViewsModel {
             if let Some(conversation_id) = closed_conversation_id {
                 // The pane-close path bypasses exit_agent_view_internal, so
                 // unregister the streamer consumer here.
-                unregister_agent_view_consumer(conversation_id, terminal_pane_id, ctx);
+                unregister_agent_event_consumer(conversation_id, terminal_pane_id, ctx);
                 ctx.emit(ActiveAgentViewsEvent::ConversationClosed { conversation_id });
             }
         }

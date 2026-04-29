@@ -42,7 +42,9 @@ use crate::{
         },
         blocklist::{
             agent_view::AgentViewEntryOrigin,
-            orchestration_event_streamer::{register_driver_consumer, unregister_driver_consumer},
+            orchestration_event_streamer::{
+                register_agent_event_consumer, unregister_agent_event_consumer,
+            },
             BlocklistAIHistoryEvent, BlocklistAIHistoryModel, BlocklistAIPermissions,
         },
         cloud_environments::{AmbientAgentEnvironment, CloudAmbientAgentEnvironment},
@@ -285,16 +287,10 @@ pub struct AgentDriver {
     /// fresh.
     resume_payload: Option<ResumePayload>,
 
-    /// Identifies this driver as a `ConsumerId::Driver` registered with
-    /// `OrchestrationEventStreamer` for the lifetime of the run. Created
-    /// once per driver instance and reused across register/unregister.
-    streamer_consumer_id: Uuid,
-
-    /// The conversation ID this driver has registered itself as a
-    /// consumer for, if any. Set on first observation (or at construction
-    /// for resumed conversations); used by `unregister_streamer_consumer`
-    /// at end of run.
-    streamer_registered_conversation_id: Option<AIConversationId>,
+    /// Conversation ID this driver is running. Set at construction for
+    /// resumed runs and on `ConversationServerTokenAssigned` for fresh
+    /// runs; consumed by `unregister_streamer_consumer` at end of run.
+    run_conversation_id: Option<AIConversationId>,
 
     /// Parent agent run's `run_id` from the server task metadata, when
     /// this driver run was spawned by another agent. Stamped onto the
@@ -637,16 +633,15 @@ impl AgentDriver {
             me.handle_terminal_driver_event(event, ctx);
         });
 
-        let streamer_consumer_id = Uuid::new_v4();
-        let mut streamer_registered_conversation_id: Option<AIConversationId> = None;
+        let mut run_conversation_id: Option<AIConversationId> = None;
 
         // For a resumed conversation the ID is known up front; register
         // immediately so the streamer can satisfy the parent gate as soon
         // as the first child is registered.
         if let Some(conv_id) = restored_conversation_id {
             stamp_parent_agent_id_if_some(conv_id, parent_run_id_for_self.as_deref(), ctx);
-            register_driver_consumer(conv_id, streamer_consumer_id, ctx);
-            streamer_registered_conversation_id = Some(conv_id);
+            register_agent_event_consumer(conv_id, ctx.model_id(), ctx);
+            run_conversation_id = Some(conv_id);
         }
 
         Ok(Self {
@@ -666,20 +661,18 @@ impl AgentDriver {
             snapshot_script_timeout: snapshot_script_timeout
                 .unwrap_or(snapshot::DEFAULT_DECLARATIONS_SCRIPT_TIMEOUT),
             resume_payload,
-            streamer_consumer_id,
-            streamer_registered_conversation_id,
+            run_conversation_id,
             parent_run_id: parent_run_id_for_self,
         })
     }
 
-    /// Pair to the driver-consumer registration in `new` and `execute_run`.
-    /// No-op when no registration was made or when `OrchestrationV2` is
-    /// disabled.
+    /// Pair to the registration in `new` / `execute_run`. No-op when
+    /// nothing was registered.
     fn unregister_streamer_consumer(&self, ctx: &mut ModelContext<Self>) {
-        let Some(conversation_id) = self.streamer_registered_conversation_id else {
+        let Some(conversation_id) = self.run_conversation_id else {
             return;
         };
-        unregister_driver_consumer(conversation_id, self.streamer_consumer_id, ctx);
+        unregister_agent_event_consumer(conversation_id, ctx.model_id(), ctx);
     }
 
     pub fn set_output_format(&mut self, output_format: OutputFormat) {
@@ -1732,16 +1725,22 @@ impl AgentDriver {
                 return;
             }
 
-            // On the first event that carries a conversation_id, stamp
-            // parent_agent_id (so the streamer recognizes the child role)
-            // and register the driver as a consumer. Idempotent for
-            // resumed conversations — those are already registered in
-            // `new`.
-            if me.streamer_registered_conversation_id.is_none() {
-                if let Some(conv_id) = event_conversation_id(event) {
-                    me.streamer_registered_conversation_id = Some(conv_id);
-                    stamp_parent_agent_id_if_some(conv_id, me.parent_run_id.as_deref(), ctx);
-                    register_driver_consumer(conv_id, me.streamer_consumer_id, ctx);
+            // Fresh runs learn their conversation_id via
+            // `ConversationServerTokenAssigned`; resumed runs already
+            // registered in `new` (and so skip this branch).
+            if me.run_conversation_id.is_none() {
+                if let BlocklistAIHistoryEvent::ConversationServerTokenAssigned {
+                    conversation_id,
+                    ..
+                } = event
+                {
+                    me.run_conversation_id = Some(*conversation_id);
+                    stamp_parent_agent_id_if_some(
+                        *conversation_id,
+                        me.parent_run_id.as_deref(),
+                        ctx,
+                    );
+                    register_agent_event_consumer(*conversation_id, ctx.model_id(), ctx);
                 }
             }
 
@@ -2368,32 +2367,6 @@ fn stamp_parent_agent_id_if_some(
             conv.set_parent_agent_id(parent_run_id);
         }
     });
-}
-
-/// Extracts the `AIConversationId` from a `BlocklistAIHistoryEvent` if the
-/// variant carries one. Used by the agent_sdk driver to discover its own
-/// conversation_id from event traffic so it can register itself as a
-/// consumer with `OrchestrationEventStreamer`.
-fn event_conversation_id(event: &BlocklistAIHistoryEvent) -> Option<AIConversationId> {
-    match event {
-        BlocklistAIHistoryEvent::AppendedExchange {
-            conversation_id, ..
-        }
-        | BlocklistAIHistoryEvent::UpdatedStreamingExchange {
-            conversation_id, ..
-        }
-        | BlocklistAIHistoryEvent::UpdatedConversationStatus {
-            conversation_id, ..
-        }
-        | BlocklistAIHistoryEvent::ReassignedExchange {
-            new_conversation_id: conversation_id,
-            ..
-        }
-        | BlocklistAIHistoryEvent::ConversationServerTokenAssigned {
-            conversation_id, ..
-        } => Some(*conversation_id),
-        _ => None,
-    }
 }
 
 /// Write the session URL to stdout using the appropriate output format
