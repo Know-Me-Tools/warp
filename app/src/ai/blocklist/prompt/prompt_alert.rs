@@ -156,9 +156,13 @@ impl PromptAlertView {
         let auth_state = AuthStateProvider::as_ref(app).get();
 
         // Next, if the user is anonymous, we check if they have reached a certain percentage of requests used.
-        if auth_state
-            .is_anonymous_user_feature_gated()
-            .unwrap_or_default()
+        // Skip this gate when the user has BYOK keys — they are supplying their own quota.
+        let has_byok_keys = UserWorkspaces::as_ref(app).is_byo_api_key_enabled()
+            && ApiKeyManager::as_ref(app).keys().has_any_key();
+        if !has_byok_keys
+            && auth_state
+                .is_anonymous_user_feature_gated()
+                .unwrap_or_default()
         {
             let percentage_used = request_usage_model.request_percentage_used();
 

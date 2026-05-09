@@ -10,13 +10,21 @@ use warp_core::{
 
 // Simple wrapper around warp::run() for Warp OSS builds.
 fn main() -> Result<()> {
+    // Allow redirecting AI requests to a local OpenAI-compatible proxy (e.g. liter-llm)
+    // so OSS users can use their own API keys without logging in to Warp.dev.
+    // Falls back to the production oz.warp.dev endpoint when unset.
+    let oz_config = match std::env::var("WARP_OSS_LLM_PROXY_URL") {
+        Ok(url) => OzConfig { oz_root_url: url.into(), ..OzConfig::production() },
+        Err(_) => OzConfig::production(),
+    };
+
     let mut state = ChannelState::new(
         Channel::Oss,
         ChannelConfig {
             app_id: AppId::new("dev", "warp", "WarpOss"),
             logfile_name: "warp-oss.log".into(),
             server_config: WarpServerConfig::production(),
-            oz_config: OzConfig::production(),
+            oz_config,
             telemetry_config: None,
             crash_reporting_config: None,
             autoupdate_config: None,
