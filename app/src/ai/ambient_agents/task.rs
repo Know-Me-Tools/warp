@@ -107,6 +107,9 @@ pub struct HarnessAuthSecretsConfig {
     /// Name of a managed secret for Claude Code harness authentication.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_auth_secret_name: Option<String>,
+    /// Name of a managed secret for Codex harness authentication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_auth_secret_name: Option<String>,
 }
 
 impl AgentConfigSnapshot {
@@ -517,6 +520,31 @@ pub struct TaskPrincipalInfo {
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct TaskStatusMessage {
     pub message: String,
+    #[serde(default, alias = "errorCode")]
+    pub error_code: Option<TaskStatusErrorCode>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatusErrorCode {
+    #[serde(alias = "ENVIRONMENT_SETUP_FAILED")]
+    EnvironmentSetupFailed,
+    #[serde(other)]
+    Unknown,
+}
+
+impl TaskStatusErrorCode {
+    pub fn is_environment_setup_failure(&self) -> bool {
+        matches!(self, TaskStatusErrorCode::EnvironmentSetupFailed)
+    }
+}
+
+impl TaskStatusMessage {
+    pub fn is_environment_setup_failure(&self) -> bool {
+        self.error_code
+            .as_ref()
+            .is_some_and(TaskStatusErrorCode::is_environment_setup_failure)
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
@@ -560,3 +588,7 @@ pub fn cancel_task_silently<V: View>(task_id: AmbientAgentTaskId, ctx: &mut View
         },
     );
 }
+
+#[cfg(test)]
+#[path = "task_tests.rs"]
+mod tests;

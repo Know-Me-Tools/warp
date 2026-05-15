@@ -83,6 +83,7 @@ pub enum OrchestrationConfigBlockAction {
     HarnessChanged { harness_type: String },
     EnvironmentChanged { environment_id: String },
     WorkerHostChanged { worker_host: String },
+    AuthSecretChanged { auth_secret_name: Option<String> },
 }
 
 impl OrchestrationControlAction for OrchestrationConfigBlockAction {
@@ -101,12 +102,16 @@ impl OrchestrationControlAction for OrchestrationConfigBlockAction {
     fn worker_host_changed(worker_host: String) -> Self {
         Self::WorkerHostChanged { worker_host }
     }
+    fn auth_secret_changed(auth_secret_name: Option<String>) -> Self {
+        Self::AuthSecretChanged { auth_secret_name }
+    }
 }
 
 // ── View ────────────────────────────────────────────────────────────
 
 pub struct OrchestrationConfigBlockView {
     conversation_id: AIConversationId,
+    plan_id: String,
     edit_state: OrchestrationEditState,
     pickers: OrchestrationPickerHandles<OrchestrationConfigBlockAction>,
     is_approved: bool,
@@ -117,23 +122,29 @@ pub struct OrchestrationConfigBlockView {
     /// UI-only per-harness model memory so switching harnesses preserves
     /// the user's previous model selection for each harness.
     saved_model_per_harness: HashMap<String, String>,
+    /// Suppresses self-triggered refresh when `apply_field_change`
+    /// saves the config and the resulting event re-enters
+    /// `refresh_from_model`.
+    suppress_refresh: bool,
 }
 
 impl OrchestrationConfigBlockView {
-    pub fn new_with_conversation_id(
+    pub fn new(
         conversation_id: AIConversationId,
+        plan_id: String,
         ctx: &mut ViewContext<Self>,
     ) -> Self {
         let history = BlocklistAIHistoryModel::as_ref(ctx);
         let (edit_state, is_approved) = history
             .conversation(&conversation_id)
             .and_then(|conv| {
-                conv.orchestration_config().map(|config| {
-                    (
-                        OrchestrationEditState::from_orchestration_config(config),
-                        conv.orchestration_status().is_approved(),
-                    )
-                })
+                conv.orchestration_config_for_plan(&plan_id)
+                    .map(|(config, status)| {
+                        (
+                            OrchestrationEditState::from_orchestration_config(config),
+                            status.is_approved(),
+                        )
+                    })
             })
             .unwrap_or_else(|| {
                 (
@@ -178,22 +189,32 @@ impl OrchestrationConfigBlockView {
             }
         });
 
-        // Repopulate harness and model pickers when the server-provided
-        // harness list or harness model catalogs change.
+        // Repopulate pickers when the server-provided harness list,
+        // harness model catalogs, or per-harness auth secrets change.
+        // Without an `AuthSecretsLoaded` handler the picker stays on
+        // "Loading…" forever after the lazy fetch completes.
         ctx.subscribe_to_model(
             &HarnessAvailabilityModel::handle(ctx),
-            |me, _, event, ctx| {
-                if let HarnessAvailabilityEvent::Changed = event {
+            |me, _, event, ctx| match event {
+                HarnessAvailabilityEvent::Changed
+                | HarnessAvailabilityEvent::AuthSecretsLoaded
+                | HarnessAvailabilityEvent::AuthSecretCreated { .. }
+                | HarnessAvailabilityEvent::AuthSecretsFetchFailed => {
+                    // Repopulate on fetch failure too, otherwise the picker
+                    // would stay on the "Loading…" placeholder we wrote
+                    // when the fetch started.
                     if me.pickers_initialized {
                         oc::repopulate_all_pickers(&mut me.edit_state, &me.pickers, ctx);
                     }
                     ctx.notify();
                 }
+                HarnessAvailabilityEvent::AuthSecretCreationFailed { .. } => {}
             },
         );
 
         let mut view = Self {
             conversation_id,
+            plan_id,
             edit_state,
             pickers: OrchestrationPickerHandles::default(),
             is_approved,
@@ -202,6 +223,7 @@ impl OrchestrationConfigBlockView {
             toggle_mouse_state: MouseStateHandle::default(),
             details_mouse_state: MouseStateHandle::default(),
             saved_model_per_harness: HashMap::new(),
+            suppress_refresh: false,
         };
         if view.is_approved {
             view.ensure_pickers(ctx);
@@ -210,11 +232,15 @@ impl OrchestrationConfigBlockView {
     }
 
     fn refresh_from_model(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.suppress_refresh {
+            self.suppress_refresh = false;
+            return;
+        }
         let history = BlocklistAIHistoryModel::as_ref(ctx);
         if let Some(conv) = history.conversation(&self.conversation_id) {
-            if let Some(config) = conv.orchestration_config() {
+            if let Some((config, status)) = conv.orchestration_config_for_plan(&self.plan_id) {
                 self.edit_state = OrchestrationEditState::from_orchestration_config(config);
-                self.is_approved = conv.orchestration_status().is_approved();
+                self.is_approved = status.is_approved();
                 if self.pickers_initialized {
                     oc::repopulate_all_pickers(&mut self.edit_state, &self.pickers, ctx);
                 }
@@ -256,9 +282,41 @@ impl OrchestrationConfigBlockView {
 
         let harness_handle = oc::new_standard_picker_dropdown(&colors, ctx);
         harness_handle.update(ctx, |d, c| d.set_use_overlay_layer(true, c));
-        oc::populate_harness_picker(&harness_handle, &self.edit_state.harness_type, ctx);
+        oc::populate_harness_picker(
+            &harness_handle,
+            &self.edit_state.harness_type,
+            is_local,
+            ctx,
+        );
         self.pickers.harness_picker = Some(harness_handle);
 
+        // When restoring a Remote config with empty host or
+        // environment, fill defaults so the pickers aren't blank.
+        // If the config is approved, persist the defaults so the
+        // stored config used by auto-launch has concrete values.
+        let (needs_host, needs_env) = match &self.edit_state.execution_mode {
+            RunAgentsExecutionMode::Remote {
+                worker_host,
+                environment_id,
+                ..
+            } => (worker_host.is_empty(), environment_id.is_empty()),
+            RunAgentsExecutionMode::Local => (false, false),
+        };
+        let mut filled_defaults = false;
+        if needs_host {
+            self.edit_state
+                .set_worker_host(oc::ORCHESTRATION_WARP_WORKER_HOST.to_string());
+            filled_defaults = true;
+        }
+        if needs_env {
+            if let Some(default_env) = oc::resolve_default_environment_id(ctx) {
+                self.edit_state.set_environment_id(default_env);
+                filled_defaults = true;
+            }
+        }
+        if filled_defaults && self.is_approved {
+            self.apply_field_change(ctx);
+        }
         let initial_env = match &self.edit_state.execution_mode {
             RunAgentsExecutionMode::Remote { environment_id, .. } => environment_id.as_str(),
             RunAgentsExecutionMode::Local => "",
@@ -276,11 +334,28 @@ impl OrchestrationConfigBlockView {
         oc::populate_host_picker(&host_handle, initial_host, ctx);
         self.pickers.host_picker = Some(host_handle);
 
+        // Seed the auth secret from persisted per-harness settings before
+        // building the picker so the dropdown shows the last selection.
+        if self.edit_state.auth_secret_name.is_none() {
+            self.edit_state.auth_secret_name =
+                oc::resolve_default_auth_secret_for_harness(&self.edit_state.harness_type, ctx);
+        }
+        let auth_secret_handle = oc::new_standard_picker_dropdown(&colors, ctx);
+        auth_secret_handle.update(ctx, |d, c| d.set_use_overlay_layer(true, c));
+        oc::populate_auth_secret_picker_for_harness(
+            &auth_secret_handle,
+            self.edit_state.auth_secret_name.as_deref(),
+            &self.edit_state.harness_type,
+            ctx,
+        );
+        self.pickers.auth_secret_picker = Some(auth_secret_handle);
+
         self.pickers_initialized = true;
         oc::sync_picker_selections(&self.edit_state, &self.pickers, ctx);
     }
 
     fn apply_field_change(&mut self, ctx: &mut ViewContext<Self>) {
+        self.suppress_refresh = true;
         let config = self.edit_state.to_orchestration_config();
         let status = if self.is_approved {
             OrchestrationConfigStatus::Approved
@@ -288,13 +363,9 @@ impl OrchestrationConfigBlockView {
             OrchestrationConfigStatus::Disapproved
         };
         let conversation_id = self.conversation_id;
-        // Preserve the existing plan_id from the conversation so we don't
-        // clobber it when the user only edits config fields.
-        let plan_id = BlocklistAIHistoryModel::as_ref(ctx)
-            .conversation(&conversation_id)
-            .and_then(|conv| conv.orchestration_plan_id().map(str::to_string));
+        let plan_id = self.plan_id.clone();
         AIDocumentModel::handle(ctx).update(ctx, |model, ctx| {
-            model.set_orchestration_config(conversation_id, config, status, plan_id, ctx);
+            model.set_orchestration_config_for_plan(conversation_id, plan_id, config, status, ctx);
         });
     }
 }
@@ -531,12 +602,29 @@ impl TypedActionView for OrchestrationConfigBlockView {
             }
             OrchestrationConfigBlockAction::EnvironmentChanged { environment_id } => {
                 self.edit_state.set_environment_id(environment_id.clone());
+                oc::persist_environment_selection(environment_id, ctx);
                 self.apply_field_change(ctx);
                 ctx.notify();
             }
             OrchestrationConfigBlockAction::WorkerHostChanged { worker_host } => {
                 self.edit_state.set_worker_host(worker_host.clone());
                 self.apply_field_change(ctx);
+                ctx.notify();
+            }
+            OrchestrationConfigBlockAction::AuthSecretChanged { auth_secret_name } => {
+                // No `apply_field_change` here: managed secrets are user-scoped
+                // (not plan-scoped), so they are persisted side-channel via
+                // `CloudAgentSettings.last_selected_auth_secret` instead of
+                // being baked into `OrchestrationConfig`. Consequence: changing
+                // the picker doesn't surface a "config modified" signal, and
+                // two users on the same approved plan can have different secret
+                // selections without conflicting.
+                oc::apply_auth_secret_change(
+                    &mut self.edit_state,
+                    &self.pickers,
+                    auth_secret_name.clone(),
+                    ctx,
+                );
                 ctx.notify();
             }
         }
