@@ -18,7 +18,7 @@ use crate::ai::blocklist::{agent_view::AgentViewEntryOrigin, BlocklistAIHistoryM
 use crate::ai::conversation_details_panel::ConversationDetailsData;
 use crate::pane_group::TerminalViewResources;
 use crate::terminal::view::rich_content::{RichContentInsertionPosition, RichContentMetadata};
-use crate::terminal::view::TerminalView;
+use crate::terminal::view::{ConversationDetailsPanelAutoOpenPolicy, TerminalView};
 use crate::terminal::CLIAgent;
 use crate::workspace::view::cloud_agent_capacity_modal::CloudAgentCapacityModalVariant;
 use crate::workspaces::user_workspaces::UserWorkspaces;
@@ -194,12 +194,13 @@ impl TerminalView {
                 ctx.notify();
             }
             AmbientAgentViewModelEvent::SessionReady { .. }
-            | AmbientAgentViewModelEvent::FollowupSessionReady { .. } => {
+            | AmbientAgentViewModelEvent::ExecutionSessionReady { .. } => {
                 if matches!(
                     event,
-                    AmbientAgentViewModelEvent::FollowupSessionReady { .. }
+                    AmbientAgentViewModelEvent::ExecutionSessionReady { .. }
                 ) {
                     self.pending_cloud_followup_task_id = None;
+                    self.remove_conversation_ended_tombstone(ctx);
                 }
                 if FeatureFlag::HandoffCloudCloud.is_enabled() {
                     self.refresh_conversation_details_panel_if_open(ctx);
@@ -849,13 +850,7 @@ impl TerminalView {
             )
         } else {
             // Show loading screen - determine the message based on progress state
-            let message = if progress.harness_started_at.is_some() {
-                "Starting Environment (Step 3/3)"
-            } else if progress.claimed_at.is_some() {
-                "Creating Environment (Step 2/3)"
-            } else {
-                "Connecting to Host (Step 1/3)"
-            };
+            let message = progress.setup_status_text();
 
             render_cloud_mode_loading_screen(
                 message,
@@ -965,9 +960,15 @@ impl TerminalView {
         if self.has_auto_opened_conversation_details_panel {
             return;
         }
-        self.is_conversation_details_panel_open = true;
         self.has_auto_opened_conversation_details_panel = true;
-        self.fetch_and_update_conversation_details_panel(ctx);
-        ctx.notify();
+
+        match self.conversation_details_panel_auto_open_policy {
+            ConversationDetailsPanelAutoOpenPolicy::DefaultOpen => {
+                self.is_conversation_details_panel_open = true;
+                self.fetch_and_update_conversation_details_panel(ctx);
+                ctx.notify();
+            }
+            ConversationDetailsPanelAutoOpenPolicy::DefaultClosed => {}
+        }
     }
 }

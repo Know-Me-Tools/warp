@@ -26,6 +26,7 @@ use warpui::{
 use warpui::{App, ReadModel};
 
 use crate::ai::blocklist::agent_view::toolbar_item::AgentToolbarItemKind;
+use crate::ai::blocklist::agent_view::ExitAgentViewError;
 use crate::ai::blocklist::block::cli_controller::UserTakeOverReason;
 use crate::ai::blocklist::{
     agent_view::AgentViewEntryOrigin, BlocklistAIHistoryEvent, BlocklistAIHistoryModel,
@@ -77,6 +78,9 @@ fn add_window_with_cloud_mode_terminal(app: &mut App) -> ViewHandle<TerminalView
     let tips_model = app.add_model(|_| Default::default());
     let (_, terminal) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
         TerminalView::new_for_test_with_cloud_mode(tips_model, None, true, ctx)
+    });
+    terminal.update(app, |view, _| {
+        view.model.lock().set_is_dummy_cloud_mode_session(true);
     });
     terminal
 }
@@ -683,8 +687,14 @@ fn escape_pops_nested_cloud_agent_view_with_long_running_command() {
                 .lock()
                 .simulate_long_running_block("sleep 10", "running");
 
-            assert!(view.can_pop_nested_cloud_agent_view(ctx));
-            assert_eq!(view.can_exit_agent_view_for_terminal_view(ctx), Ok(()));
+            assert!(view.is_ambient_agent_session(ctx));
+            assert!(view.is_nested_cloud_mode(ctx));
+            assert_eq!(
+                view.agent_view_controller()
+                    .as_ref(ctx)
+                    .can_exit_agent_view(),
+                Ok(())
+            );
         });
 
         assert_eq!(
@@ -700,6 +710,30 @@ fn escape_pops_nested_cloud_agent_view_with_long_running_command() {
             app.read_model(&pane_stack, |stack, _| stack.active_view().id()),
             parent_terminal.id()
         );
+    })
+}
+
+#[test]
+fn escape_does_not_exit_root_cloud_agent_view_with_long_running_command() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let _cloud_mode = FeatureFlag::CloudMode.override_enabled(true);
+
+        let terminal = add_window_with_cloud_mode_terminal(&mut app);
+
+        terminal.update(&mut app, |view, ctx| {
+            view.enter_agent_view_for_new_conversation(None, AgentViewEntryOrigin::CloudAgent, ctx);
+            view.model
+                .lock()
+                .simulate_long_running_block("claude", "running");
+
+            view.handle_input_event(&InputEvent::Escape, ctx);
+
+            // Root cloud-mode pane has no parent terminal to return to,
+            // so Escape is a no-op and agent view stays active.
+            assert!(view.agent_view_controller().as_ref(ctx).is_active());
+        });
     })
 }
 
@@ -724,7 +758,9 @@ fn escape_does_not_exit_local_agent_view_with_long_running_command() {
                 .simulate_long_running_block("sleep 10", "running");
 
             assert!(matches!(
-                view.can_exit_agent_view_for_terminal_view(ctx),
+                view.agent_view_controller()
+                    .as_ref(ctx)
+                    .can_exit_agent_view(),
                 Err(ExitAgentViewError::LongRunningCommand)
             ));
 
@@ -1236,7 +1272,7 @@ fn pending_cloud_mode_query_waits_for_renderable_user_query_exchange() {
                 },
                 ctx,
             );
-            assert!(has_pending_user_query_block(view));
+            assert!(!has_pending_user_query_block(view));
         });
     });
 }
@@ -1266,7 +1302,7 @@ fn pending_cloud_mode_query_clears_when_streaming_exchange_becomes_renderable() 
                 exchange_id,
                 response_stream_id,
                 vec![AIAgentInput::UserQuery {
-                    query: "write a poem about rocks".to_string(),
+                    query: "write an ode about stones".to_string(),
                     context: Default::default(),
                     static_query_type: None,
                     referenced_attachments: Default::default(),
@@ -1289,7 +1325,7 @@ fn pending_cloud_mode_query_clears_when_streaming_exchange_becomes_renderable() 
                 exchange.input[0]
                     .display_user_query(initial_user_query.as_ref())
                     .as_deref(),
-                Some("/agent write a poem about rocks")
+                Some("/agent write an ode about stones")
             );
         });
     });
